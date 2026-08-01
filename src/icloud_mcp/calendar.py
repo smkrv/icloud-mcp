@@ -2,6 +2,7 @@
 
 import caldav
 import smtplib
+import ssl
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
 from urllib.parse import urlparse
@@ -19,6 +20,31 @@ def _get_caldav_client(email: str, password: str) -> caldav.DAVClient:
         username=email,
         password=password
     )
+
+
+def _require_trusted_dav_url(url: str, kind: str) -> None:
+    """Reject absolute URLs that point away from the configured CalDAV server.
+
+    calendar_id / event_id values are passed verbatim to the DAV client with
+    the user's Basic-Auth credentials attached, so an absolute URL naming a
+    foreign host would leak those credentials to that host. Relative paths
+    resolve against the configured server and are always fine. Provider
+    partition hosts (e.g. p72-caldav.icloud.com for caldav.icloud.com) stay
+    allowed via the shared parent domain.
+    """
+    parsed = urlparse(url)
+    if not parsed.scheme and not parsed.netloc:
+        return
+    base = urlparse(config.CALDAV_SERVER)
+    host = parsed.hostname or ""
+    base_host = base.hostname or ""
+    base_domain = base_host.split(".", 1)[-1] if "." in base_host else base_host
+    same_domain = host == base_host or host == base_domain or host.endswith("." + base_domain)
+    if parsed.scheme != base.scheme or not same_domain:
+        raise ValueError(
+            f"{kind} must be a relative path or a {base.scheme} URL under "
+            f"{base_domain}; refusing to send credentials to {parsed.scheme}://{host}"
+        )
 
 
 def _send_calendar_invitation(
@@ -99,7 +125,9 @@ End: {end}"""
     # Send via SMTP
     smtp_client = smtplib.SMTP(config.SMTP_SERVER, config.SMTP_PORT)
     try:
-        smtp_client.starttls()
+        # Explicit context: bare starttls() on Python <3.13 skips certificate
+        # verification, allowing credential theft by a MITM.
+        smtp_client.starttls(context=ssl.create_default_context())
         smtp_client.login(organizer_email, organizer_password)
         smtp_client.send_message(msg, from_addr=organizer_email, to_addrs=[attendee_email])
     finally:
@@ -198,6 +226,7 @@ async def list_events(
 
     # Get calendars
     if calendar_id:
+        _require_trusted_dav_url(calendar_id, "calendar_id")
         calendars_to_search = [caldav.Calendar(client=client, url=calendar_id)]
     else:
         all_calendars = principal.calendars()
@@ -300,6 +329,7 @@ async def create_event(
 
     # Get calendar
     if calendar_id:
+        _require_trusted_dav_url(calendar_id, "calendar_id")
         calendar = caldav.Calendar(client=client, url=calendar_id)
     else:
         all_calendars = principal.calendars()
@@ -426,6 +456,7 @@ async def update_event(
 
     # Create a client with the correct base URL for this specific event
     # This prevents URL joining errors when event is on a different server (e.g., p72-caldav.icloud.com)
+    _require_trusted_dav_url(event_id, "event_id")
     parsed = urlparse(event_id)
     event_base_url = f"{parsed.scheme}://{parsed.netloc}"
     event_client = caldav.DAVClient(url=event_base_url, username=email, password=password)
@@ -541,6 +572,7 @@ async def delete_event(context: Context, event_id: str) -> Dict[str, str]:
 
     # Create a client with the correct base URL for this specific event
     # This prevents URL joining errors when event is on a different server (e.g., p72-caldav.icloud.com)
+    _require_trusted_dav_url(event_id, "event_id")
     parsed = urlparse(event_id)
     event_base_url = f"{parsed.scheme}://{parsed.netloc}"
     event_client = caldav.DAVClient(url=event_base_url, username=email, password=password)

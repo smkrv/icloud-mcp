@@ -2,6 +2,7 @@
 
 import imaplib
 import smtplib
+import ssl
 import email
 import logging
 import sys
@@ -49,7 +50,9 @@ def _close_imap_client(client: IMAPClient) -> None:
 def _get_smtp_client(username: str, password: str) -> smtplib.SMTP:
     """Create SMTP client (stateless)."""
     client = smtplib.SMTP(config.SMTP_SERVER, config.SMTP_PORT)
-    client.starttls()
+    # Explicit context: bare starttls() on Python <3.13 skips certificate
+    # verification, allowing credential theft by a MITM.
+    client.starttls(context=ssl.create_default_context())
     client.login(username, password)
     return client
 
