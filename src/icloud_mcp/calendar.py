@@ -1,16 +1,23 @@
 """CalDAV tools for calendar management."""
 
 import caldav
+import os
+import re
 import smtplib
 import ssl
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import List, Dict, Any, Optional
 from urllib.parse import urlparse
+from zoneinfo import ZoneInfo
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from fastmcp import Context
-from .auth import require_auth
+from .auth import require_auth, require_trusted_url
 from .config import config
+
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 def _get_caldav_client(email: str, password: str) -> caldav.DAVClient:
@@ -22,29 +29,56 @@ def _get_caldav_client(email: str, password: str) -> caldav.DAVClient:
     )
 
 
-def _require_trusted_dav_url(url: str, kind: str) -> None:
-    """Reject absolute URLs that point away from the configured CalDAV server.
+def _default_tz():
+    """Timezone for naive datetime inputs: DEFAULT_TZ env var, else system local."""
+    name = os.getenv("DEFAULT_TZ", "").strip()
+    if name:
+        try:
+            return ZoneInfo(name)
+        except Exception:
+            pass
+    return datetime.now().astimezone().tzinfo
 
-    calendar_id / event_id values are passed verbatim to the DAV client with
-    the user's Basic-Auth credentials attached, so an absolute URL naming a
-    foreign host would leak those credentials to that host. Relative paths
-    resolve against the configured server and are always fine. Provider
-    partition hosts (e.g. p72-caldav.icloud.com for caldav.icloud.com) stay
-    allowed via the shared parent domain.
+
+def _ics_escape(text: str) -> str:
+    """Escape TEXT property values per RFC 5545 (incl. newlines)."""
+    return (
+        text.replace("\\", "\\\\")
+        .replace(";", "\\;")
+        .replace(",", "\\,")
+        .replace("\r\n", "\\n")
+        .replace("\n", "\\n")
+        .replace("\r", "\\n")
+    )
+
+
+def _validate_attendee_email(attendee_email: str) -> str:
+    """Reject attendee addresses that could inject ICS properties or headers."""
+    cleaned = attendee_email.strip()
+    if not re.fullmatch(r"[^\s;,:\\\"'<>]+@[^\s;,:\\\"'<>]+", cleaned):
+        raise ValueError(f"Invalid attendee email address: {attendee_email!r}")
+    return cleaned
+
+
+def _ics_dt_line(prop: str, value: str) -> str:
+    """Render DTSTART/DTEND from an ISO string.
+
+    Date-only input becomes an all-day VALUE=DATE property. Datetimes are
+    converted to UTC (naive input is interpreted in DEFAULT_TZ / system tz) —
+    previously the offset was silently dropped, shifting events for any
+    caller that passed UTC or an explicit offset.
     """
-    parsed = urlparse(url)
-    if not parsed.scheme and not parsed.netloc:
-        return
-    base = urlparse(config.CALDAV_SERVER)
-    host = parsed.hostname or ""
-    base_host = base.hostname or ""
-    base_domain = base_host.split(".", 1)[-1] if "." in base_host else base_host
-    same_domain = host == base_host or host == base_domain or host.endswith("." + base_domain)
-    if parsed.scheme != base.scheme or not same_domain:
-        raise ValueError(
-            f"{kind} must be a relative path or a {base.scheme} URL under "
-            f"{base_domain}; refusing to send credentials to {parsed.scheme}://{host}"
-        )
+    if len(value) == 10:
+        return f"{prop};VALUE=DATE:{date.fromisoformat(value).strftime('%Y%m%d')}"
+    dt = datetime.fromisoformat(value)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=_default_tz())
+    return f"{prop}:{dt.astimezone(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
+
+
+def _require_trusted_dav_url(url: str, kind: str) -> None:
+    """Reject absolute URLs pointing away from the configured CalDAV server."""
+    require_trusted_url(url, config.CALDAV_SERVER, kind)
 
 
 def _send_calendar_invitation(
@@ -96,9 +130,11 @@ End: {end}"""
 
     msg.attach(MIMEText(text_body, 'plain'))
 
-    # Modify iCalendar data to include METHOD
-    # Replace the first line with VCALENDAR and METHOD
-    ical_lines = ical_data.strip().split('\n')
+    # Modify iCalendar data to include METHOD.
+    # Normalize CRLF first: serialized vobject data (update/cancel paths) uses
+    # \r\n, and the un-normalized comparison silently skipped METHOD insertion,
+    # so cancellations went out without METHOD:CANCEL and were ignored.
+    ical_lines = ical_data.strip().replace('\r\n', '\n').split('\n')
     if ical_lines[0] == 'BEGIN:VCALENDAR':
         # Insert METHOD after BEGIN:VCALENDAR
         ical_lines.insert(1, f'METHOD:{method}')
@@ -123,7 +159,7 @@ End: {end}"""
     msg.attach(cal_part)
 
     # Send via SMTP
-    smtp_client = smtplib.SMTP(config.SMTP_SERVER, config.SMTP_PORT)
+    smtp_client = smtplib.SMTP(config.SMTP_SERVER, config.SMTP_PORT, timeout=30)
     try:
         # Explicit context: bare starttls() on Python <3.13 skips certificate
         # verification, allowing credential theft by a MITM.
@@ -139,8 +175,9 @@ End: {end}"""
 
         imap_client = _get_imap_client(organizer_email, organizer_password)
         try:
-            # Convert message to bytes
-            msg_bytes = msg.as_bytes()
+            # Convert message to bytes (CRLF per RFC 3501 for IMAP APPEND)
+            import email.policy as _email_policy
+            msg_bytes = msg.as_bytes(policy=_email_policy.SMTP)
 
             # Try to append to Sent folder
             try:
@@ -204,7 +241,10 @@ async def list_events(
     client = _get_caldav_client(email, password)
     principal = client.principal()
 
-    # Parse dates
+    # Parse dates. Naive inputs are interpreted in DEFAULT_TZ (or system tz):
+    # the caldav library treats naive datetimes as container-local time, which
+    # shifted the search window by the user's UTC offset when TZ=UTC.
+    tz = _default_tz()
     if start_date:
         start = datetime.fromisoformat(start_date)
         # If only date provided (no time), set to start of day
@@ -212,15 +252,18 @@ async def list_events(
             start = start.replace(hour=0, minute=0, second=0, microsecond=0)
     else:
         start = datetime.now() - timedelta(days=90)
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=tz)
 
     if end_date:
         end = datetime.fromisoformat(end_date)
         # If only date provided (no time), set to end of day
         if len(end_date) == 10:  # Format: YYYY-MM-DD
-            # Add one day to include the entire end date
             end = end.replace(hour=23, minute=59, second=59, microsecond=999999)
     else:
         end = datetime.now() + timedelta(days=365)
+    if end.tzinfo is None:
+        end = end.replace(tzinfo=tz)
 
     result = []
 
@@ -246,8 +289,9 @@ async def list_events(
     # Search events in all relevant calendars
     for calendar in calendars_to_search:
         try:
-            # Fetch events using date_search
-            events = calendar.date_search(start=start, end=end, expand=True)
+            # calendar.search is the supported API (date_search is deprecated
+            # since caldav 3.0 and scheduled for removal in 4.0)
+            events = calendar.search(start=start, end=end, event=True, expand=True)
 
             for event in events:
                 try:
@@ -289,10 +333,13 @@ async def list_events(
                         "url": str(event.url)
                     })
                 except Exception as _e:
-                    # Skip malformed events
+                    # Skip malformed events, but leave a trace for operators
+                    logger.warning("Skipping malformed event in %r: %s", calendar.name, _e)
                     continue
         except Exception as _e:
-            # Skip calendars that fail to search
+            # Skip calendars that fail to search, but leave a trace: a swallowed
+            # auth/network failure otherwise looks identical to "no events"
+            logger.warning("Calendar search failed for %r: %s", calendar.name, _e)
             continue
 
     return result
@@ -348,9 +395,15 @@ async def create_event(
         calendar = event_calendars[0]
 
     # Build iCalendar data with proper formatting for iCloud
-    start_dt = datetime.fromisoformat(start)
-    end_dt = datetime.fromisoformat(end)
-    now = datetime.now()
+    now = datetime.now(timezone.utc)
+
+    # All-day handling: date-only start/end become VALUE=DATE; DTEND is
+    # exclusive per RFC 5545, so a same-day range gets bumped by one day.
+    start_line = _ics_dt_line("DTSTART", start)
+    if len(start) == 10 and len(end) == 10 and date.fromisoformat(end) <= date.fromisoformat(start):
+        end_line = f"DTEND;VALUE=DATE:{(date.fromisoformat(start) + timedelta(days=1)).strftime('%Y%m%d')}"
+    else:
+        end_line = _ics_dt_line("DTEND", end)
 
     # Generate UID without dots (iCloud compatible)
     uid = f"{int(now.timestamp())}{now.microsecond}@icloud-mcp"
@@ -363,23 +416,21 @@ CALSCALE:GREGORIAN
 BEGIN:VEVENT
 UID:{uid}
 DTSTAMP:{now.strftime('%Y%m%dT%H%M%SZ')}
-DTSTART:{start_dt.strftime('%Y%m%dT%H%M%S')}
-DTEND:{end_dt.strftime('%Y%m%dT%H%M%S')}
-SUMMARY:{summary}
+{start_line}
+{end_line}
+SUMMARY:{_ics_escape(summary)}
 STATUS:CONFIRMED
 SEQUENCE:0
 """
 
     if description:
-        # Escape special characters in description
-        desc_escaped = description.replace('\\', '\\\\').replace(',', '\\,').replace(';', '\\;').replace('\n', '\\n')
-        ical_data += f"DESCRIPTION:{desc_escaped}\n"
+        ical_data += f"DESCRIPTION:{_ics_escape(description)}\n"
     if location:
-        loc_escaped = location.replace('\\', '\\\\').replace(',', '\\,').replace(';', '\\;')
-        ical_data += f"LOCATION:{loc_escaped}\n"
+        ical_data += f"LOCATION:{_ics_escape(location)}\n"
 
     # Add attendees (meeting invitations)
     if attendees:
+        attendees = [_validate_attendee_email(a) for a in attendees]
         for attendee_email in attendees:
             # Format: ATTENDEE;CN=email;ROLE=REQ-PARTICIPANT;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:email
             ical_data += f"ATTENDEE;CN={attendee_email};CUTYPE=INDIVIDUAL;ROLE=REQ-PARTICIPANT;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:{attendee_email}\n"
@@ -490,6 +541,7 @@ async def update_event(
 
     # Update attendees
     if attendees is not None:
+        attendees = [_validate_attendee_email(a) for a in attendees]
         # Remove existing attendees
         if hasattr(vevent, 'attendee_list'):
             for att in list(vevent.attendee_list):

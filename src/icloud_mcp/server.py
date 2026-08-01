@@ -19,7 +19,7 @@ async def health_check(request):
     return JSONResponse({
         "status": "healthy",
         "service": "icloud-mcp",
-        "transport": "sse"
+        "transport": "http"
     })
 
 
@@ -45,9 +45,9 @@ async def calendar_list_calendars(context: Context) -> list | dict:
 @mcp.tool()
 async def calendar_list_events(
     context: Context,
-    calendar_id: str = None,
-    start_date: str = None,
-    end_date: str = None
+    calendar_id: str | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None
 ) -> list | dict:
     """
     List calendar events with optional filtering.
@@ -71,10 +71,10 @@ async def calendar_create_event(
     summary: str,
     start: str,
     end: str,
-    description: str = None,
-    location: str = None,
-    attendees: list[str] = None,
-    calendar_id: str = None
+    description: str | None = None,
+    location: str | None = None,
+    attendees: list[str] | None = None,
+    calendar_id: str | None = None
 ) -> dict:
     """
     Create a new calendar event.
@@ -100,12 +100,12 @@ async def calendar_create_event(
 async def calendar_update_event(
     context: Context,
     event_id: str,
-    summary: str = None,
-    start: str = None,
-    end: str = None,
-    description: str = None,
-    location: str = None,
-    attendees: list[str] = None
+    summary: str | None = None,
+    start: str | None = None,
+    end: str | None = None,
+    description: str | None = None,
+    location: str | None = None,
+    attendees: list[str] | None = None
 ) -> dict:
     """
     Update an existing calendar event.
@@ -147,9 +147,9 @@ async def calendar_delete_event(context: Context, event_id: str) -> dict:
 async def calendar_search_events(
     context: Context,
     query: str,
-    calendar_id: str = None,
-    start_date: str = None,
-    end_date: str = None
+    calendar_id: str | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None
 ) -> list | dict:
     """
     Search for events by text query.
@@ -173,7 +173,7 @@ async def calendar_search_events(
 # ============================================================================
 
 @mcp.tool()
-async def contacts_list(context: Context, limit: int = None) -> list | dict:
+async def contacts_list(context: Context, limit: int | None = None) -> list | dict:
     """
     List all contacts.
 
@@ -208,11 +208,11 @@ async def contacts_get(context: Context, contact_id: str) -> dict:
 async def contacts_create(
     context: Context,
     name: str,
-    phones: list[str] = None,
-    emails: list[str] = None,
-    addresses: list[str] = None,
-    organization: str = None,
-    title: str = None
+    phones: list[str] | None = None,
+    emails: list[str] | None = None,
+    addresses: list[str] | None = None,
+    organization: str | None = None,
+    title: str | None = None
 ) -> dict:
     """
     Create a new contact.
@@ -237,12 +237,12 @@ async def contacts_create(
 async def contacts_update(
     context: Context,
     contact_id: str,
-    name: str = None,
-    phones: list[str] = None,
-    emails: list[str] = None,
-    addresses: list[str] = None,
-    organization: str = None,
-    title: str = None
+    name: str | None = None,
+    phones: list[str] | None = None,
+    emails: list[str] | None = None,
+    addresses: list[str] | None = None,
+    organization: str | None = None,
+    title: str | None = None
 ) -> dict:
     """
     Update an existing contact.
@@ -319,7 +319,7 @@ async def email_list_folders(context: Context) -> list | dict:
 async def email_list_messages(
     context: Context,
     folder: str = "INBOX",
-    limit: int = 50,
+    limit: int = 20,
     unread_only: bool = False
 ) -> list | dict:
     """
@@ -395,7 +395,7 @@ async def email_search(
     context: Context,
     query: str,
     folder: str = "INBOX",
-    limit: int = 50
+    limit: int = 20
 ) -> list | dict:
     """
     Search for messages by text query.
@@ -419,8 +419,8 @@ async def email_send(
     to: str,
     subject: str,
     body: str,
-    cc: str = None,
-    bcc: str = None,
+    cc: str | None = None,
+    bcc: str | None = None,
     html: bool = False
 ) -> dict:
     """
@@ -536,14 +536,7 @@ async def email_mark_unread(
 
 def run():
     """Run the MCP server."""
-    from .config import config as app_config
     mcp.run(transport="stdio")
-
-
-def run_http():
-    """Run the MCP server with HTTP transport."""
-    from .config import config as app_config
-    mcp.run(transport="sse", port=app_config.MCP_SERVER_PORT)
 
 
 if __name__ == "__main__":

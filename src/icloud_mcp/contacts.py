@@ -1,15 +1,52 @@
 """CardDAV tools for contacts management using direct HTTP/WebDAV requests."""
 
+import logging
 import requests
 from requests.auth import HTTPBasicAuth
 import vobject
 from typing import List, Dict, Any, Optional
 from fastmcp import Context
-from .auth import require_auth
+from .auth import require_auth, require_trusted_url
 from .config import config
 import xml.etree.ElementTree as ET
 from urllib.parse import urljoin
 import uuid
+
+logger = logging.getLogger(__name__)
+
+
+def _require_trusted_contact_url(contact_id: str) -> None:
+    """Reject contact_id URLs pointing away from the configured CardDAV server.
+
+    The requests session sends Basic-Auth credentials PREEMPTIVELY on every
+    request, so without this check a foreign contact_id URL hands the user's
+    credentials to that host on the very first GET/PUT/DELETE.
+    """
+    require_trusted_url(contact_id, config.CARDDAV_SERVER, "contact_id")
+
+
+def _parse_vcard_contact(vcard, contact_id: str) -> Dict[str, Any]:
+    """Render a vobject vCard into the tool-facing contact dict."""
+    contact = {
+        "id": contact_id,
+        "name": str(vcard.fn.value) if hasattr(vcard, 'fn') else "",
+        "phones": [],
+        "emails": [],
+        "addresses": [],
+        "organization": str(vcard.org.value[0]) if hasattr(vcard, 'org') and vcard.org.value else "",
+        "title": str(vcard.title.value) if hasattr(vcard, 'title') else "",
+        "url": contact_id
+    }
+    if hasattr(vcard, 'tel_list'):
+        for tel in vcard.tel_list:
+            contact["phones"].append(str(tel.value))
+    if hasattr(vcard, 'email_list'):
+        for em in vcard.email_list:
+            contact["emails"].append(str(em.value))
+    if hasattr(vcard, 'adr_list'):
+        for adr in vcard.adr_list:
+            contact["addresses"].append(str(adr.value))
+    return contact
 
 
 def _get_carddav_session(email: str, password: str) -> tuple:
@@ -123,7 +160,7 @@ def _fetch_all_vcards(session: requests.Session, addressbook_url: str) -> List[D
         response = session.request('REPORT', addressbook_url, data=query_body, headers={'Depth': '1'})
         response.raise_for_status()
     except Exception as e:
-        print(f"Error fetching vCards: {str(e)}")
+        logger.warning("Error fetching vCards from %s: %s", addressbook_url, e)
         return []
     
     # Parse XML response
@@ -144,8 +181,8 @@ def _fetch_all_vcards(session: requests.Session, addressbook_url: str) -> List[D
                     'etag': etag_elem.text if etag_elem is not None else ''
                 })
     except Exception as e:
-        print(f"Error parsing vCards: {str(e)}")
-    
+        logger.warning("Error parsing vCards response: %s", e)
+
     return vcards
 
 
@@ -174,17 +211,17 @@ async def list_contacts(
         
         if not addressbooks:
             return []
-        
-        # Use first addressbook
-        addressbook_url = addressbooks[0]['url']
-        
-        # Fetch all vCards
-        vcards = _fetch_all_vcards(session, addressbook_url)
-        
+
+        # Fetch vCards from ALL addressbooks (contacts in books beyond the
+        # first were silently invisible before)
+        vcards = []
+        for book in addressbooks:
+            vcards.extend(_fetch_all_vcards(session, book['url']))
+
         # Parse vCards
         result = []
         count = 0
-        
+
         for vcard_data in vcards:
             if limit and count >= limit:
                 break
@@ -234,7 +271,7 @@ async def list_contacts(
                     count += 1
             
             except Exception as e:
-                print(f"Error parsing vCard: {str(e)}")
+                logger.warning("Error parsing vCard: %s", e)
                 continue
         
         return result
@@ -254,42 +291,16 @@ async def get_contact(context: Context, contact_id: str) -> Dict[str, Any]:
         Contact details
     """
     email, password = require_auth(context)
+    _require_trusted_contact_url(contact_id)
     session, _ = _get_carddav_session(email, password)
-    
+
     try:
         response = session.get(contact_id)
         response.raise_for_status()
-        
+
         vcard = vobject.readOne(response.text)
-        
-        contact = {
-            "id": contact_id,
-            "name": str(vcard.fn.value) if hasattr(vcard, 'fn') else "",
-            "phones": [],
-            "emails": [],
-            "addresses": [],
-            "organization": str(vcard.org.value[0]) if hasattr(vcard, 'org') and vcard.org.value else "",
-            "title": str(vcard.title.value) if hasattr(vcard, 'title') else "",
-            "url": contact_id
-        }
-        
-        # Extract phone numbers
-        if hasattr(vcard, 'tel_list'):
-            for tel in vcard.tel_list:
-                contact["phones"].append(str(tel.value))
-        
-        # Extract emails
-        if hasattr(vcard, 'email_list'):
-            for em in vcard.email_list:
-                contact["emails"].append(str(em.value))
-        
-        # Extract addresses
-        if hasattr(vcard, 'adr_list'):
-            for adr in vcard.adr_list:
-                contact["addresses"].append(str(adr.value))
-        
-        return contact
-    
+        return _parse_vcard_contact(vcard, contact_id)
+
     except Exception as e:
         raise ValueError(f"Failed to get contact: {str(e)}")
 
@@ -425,8 +436,9 @@ async def update_contact(
         Updated contact details
     """
     email, password = require_auth(context)
+    _require_trusted_contact_url(contact_id)
     session, _ = _get_carddav_session(email, password)
-    
+
     try:
         # Get existing vCard
         response = session.get(contact_id)
@@ -492,18 +504,11 @@ async def update_contact(
         
         response = session.put(contact_id, data=vcard_data, headers=headers)
         response.raise_for_status()
-        
-        return {
-            "id": contact_id,
-            "name": str(vcard.fn.value) if hasattr(vcard, 'fn') else "",
-            "phones": phones if phones is not None else [],
-            "emails": emails if emails is not None else [],
-            "addresses": addresses if addresses is not None else [],
-            "organization": organization or "",
-            "title": title or "",
-            "url": contact_id
-        }
-    
+
+        # Return the ACTUAL updated vCard state: echoing the sparse input
+        # made untouched fields look wiped (phones/emails/addresses = [])
+        return _parse_vcard_contact(vcard, contact_id)
+
     except Exception as e:
         raise ValueError(f"Failed to update contact: {str(e)}")
 
@@ -519,8 +524,9 @@ async def delete_contact(context: Context, contact_id: str) -> Dict[str, str]:
         Confirmation message
     """
     email, password = require_auth(context)
+    _require_trusted_contact_url(contact_id)
     session, _ = _get_carddav_session(email, password)
-    
+
     try:
         response = session.delete(contact_id)
         response.raise_for_status()

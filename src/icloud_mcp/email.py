@@ -4,6 +4,7 @@ import imaplib
 import smtplib
 import ssl
 import email
+import email.policy
 import logging
 import sys
 import os
@@ -31,7 +32,9 @@ logger.addHandler(stderr_handler)
 
 def _get_imap_client(username: str, password: str) -> IMAPClient:
     """Create IMAP client (stateless)."""
-    client = IMAPClient(config.IMAP_SERVER, port=config.IMAP_PORT, ssl=True, use_uid=True)
+    # timeout: tools run synchronously on the server's event loop, so a hung
+    # TCP connection without a timeout would freeze every tool incl. /health
+    client = IMAPClient(config.IMAP_SERVER, port=config.IMAP_PORT, ssl=True, use_uid=True, timeout=30)
     client.login(username, password)
     return client
 
@@ -47,9 +50,41 @@ def _close_imap_client(client: IMAPClient) -> None:
         pass  # Silently ignore errors on close
 
 
+def _find_trash_folder(client: IMAPClient) -> Optional[str]:
+    """Locate the trash folder via SPECIAL-USE \\Trash, then common names."""
+    try:
+        import imapclient as _imapclient
+        special = client.find_special_folder(_imapclient.TRASH)
+        if special:
+            return special
+    except Exception:
+        pass
+    try:
+        existing = {f[2] for f in client.list_folders()}
+    except Exception:
+        return None
+    for name in ('Deleted Messages', 'Trash', 'Deleted Items', 'Корзина'):
+        if name in existing:
+            return name
+    return None
+
+
+def _expunge_message(client: IMAPClient, msg_id: int) -> None:
+    """Expunge only the targeted message (UID EXPUNGE), not the whole folder.
+
+    A bare EXPUNGE also purges messages other clients (e.g. iPhone Mail)
+    flagged \\Deleted but not yet expunged. Falls back to full expunge only
+    when the server lacks UIDPLUS.
+    """
+    try:
+        client.expunge([msg_id])
+    except Exception:
+        client.expunge()
+
+
 def _get_smtp_client(username: str, password: str) -> smtplib.SMTP:
     """Create SMTP client (stateless)."""
-    client = smtplib.SMTP(config.SMTP_SERVER, config.SMTP_PORT)
+    client = smtplib.SMTP(config.SMTP_SERVER, config.SMTP_PORT, timeout=30)
     # Explicit context: bare starttls() on Python <3.13 skips certificate
     # verification, allowing credential theft by a MITM.
     client.starttls(context=ssl.create_default_context())
@@ -112,7 +147,7 @@ async def list_folders(context: Context) -> List[Dict[str, Any]]:
 async def list_messages(
     context: Context,
     folder: str = "INBOX",
-    limit: int = 50,
+    limit: int = 20,
     unread_only: bool = False
 ) -> List[Dict[str, Any]]:
     """
@@ -180,6 +215,11 @@ async def list_messages(
                         body_text = msg.get_payload(decode=True).decode('utf-8', errors='ignore')
                     except Exception as _e:
                         pass
+
+                # Truncate list-view bodies: full bodies of dozens of messages
+                # blow up the caller's context (use get_message for full text)
+                if len(body_text) > 500:
+                    body_text = body_text[:500] + "… [truncated, use email_get_message for full text]"
 
                 result.append({
                     "id": str(msg_id),
@@ -272,12 +312,14 @@ async def get_message(
             if msg.is_multipart():
                 for part in msg.walk():
                     content_type = part.get_content_type()
-                    if content_type == "text/plain":
+                    # keep only the FIRST part of each type: without the guard
+                    # a later text/plain attachment overwrote the actual body
+                    if content_type == "text/plain" and not body_text:
                         try:
                             body_text = part.get_payload(decode=True).decode('utf-8', errors='ignore')
                         except Exception as _e:
                             pass
-                    elif content_type == "text/html" and full_html:
+                    elif content_type == "text/html" and full_html and not body_html:
                         try:
                             body_html = part.get_payload(decode=True).decode('utf-8', errors='ignore')
                         except Exception as _e:
@@ -637,8 +679,9 @@ async def send_message(
             msg['Date'] = formatdate(localtime=True)
 
         # Append message to Sent folder
-        # Convert message to bytes
-        msg_bytes = msg.as_bytes()
+        # SMTP policy: IMAP APPEND requires CRLF line endings (RFC 3501);
+        # bare as_bytes() emits LF and some servers mangle the stored copy
+        msg_bytes = msg.as_bytes(policy=email.policy.SMTP)
 
         # Try to append to Sent folder
         try:
@@ -699,7 +742,7 @@ async def move_message(
 
         # Delete from source
         client.delete_messages([msg_id])
-        client.expunge()
+        _expunge_message(client, msg_id)
 
         return {
             "status": "success",
@@ -739,20 +782,23 @@ async def delete_message(
         if permanent:
             # Permanent deletion
             client.delete_messages([msg_id])
-            client.expunge()
+            _expunge_message(client, msg_id)
             message = f"Message {message_id} permanently deleted"
         else:
-            # Move to Trash
-            try:
-                client.copy([msg_id], 'Trash')
-                client.delete_messages([msg_id])
-                client.expunge()
-                message = f"Message {message_id} moved to Trash"
-            except Exception as _e:
-                # Fallback to permanent delete if Trash doesn't exist
-                client.delete_messages([msg_id])
-                client.expunge()
-                message = f"Message {message_id} deleted"
+            # Move to trash. NEVER fall back to permanent deletion: the old
+            # fallback turned ANY copy failure (folder named "Deleted
+            # Messages" on iCloud, network hiccup, quota) into a silent
+            # permanent delete reported as "moved to Trash".
+            trash = _find_trash_folder(client)
+            if trash is None:
+                raise ValueError(
+                    "No trash folder found on the server; "
+                    "pass permanent=True to delete permanently"
+                )
+            client.copy([msg_id], trash)
+            client.delete_messages([msg_id])
+            _expunge_message(client, msg_id)
+            message = f"Message {message_id} moved to {trash}"
 
         return {
             "status": "success",

@@ -1,6 +1,7 @@
 """Authentication management for iCloud MCP server."""
 
 from typing import Tuple, Optional
+from urllib.parse import urlparse
 from fastmcp import Context
 from fastmcp.server.dependencies import get_http_headers
 from .config import config
@@ -9,6 +10,31 @@ from .config import config
 class AuthenticationError(Exception):
     """Raised when authentication fails."""
     pass
+
+
+def require_trusted_url(url: str, base: str, kind: str) -> None:
+    """Reject absolute URLs that point away from *base*'s host family.
+
+    Object ids (calendar_id / event_id / contact_id) are caller-controlled
+    URLs that get requested with the user's Basic-Auth credentials attached,
+    so an absolute URL naming a foreign host leaks those credentials to that
+    host. Relative paths resolve against the configured server and are fine.
+    Provider partition hosts (e.g. p72-caldav.icloud.com) stay allowed via
+    the shared parent domain.
+    """
+    parsed = urlparse(url)
+    if not parsed.scheme and not parsed.netloc:
+        return
+    base_parsed = urlparse(base)
+    host = parsed.hostname or ""
+    base_host = base_parsed.hostname or ""
+    base_domain = base_host.split(".", 1)[-1] if "." in base_host else base_host
+    same_domain = host == base_host or host == base_domain or host.endswith("." + base_domain)
+    if parsed.scheme != base_parsed.scheme or not same_domain:
+        raise ValueError(
+            f"{kind} must be a relative path or a {base_parsed.scheme} URL under "
+            f"{base_domain}; refusing to send credentials to {parsed.scheme}://{host}"
+        )
 
 
 def get_credentials(context: Context) -> Tuple[str, str]:
