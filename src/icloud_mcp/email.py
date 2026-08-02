@@ -8,9 +8,12 @@ import email.policy
 import logging
 import sys
 import os
+import functools
+import anyio
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.header import decode_header
+from email.utils import getaddresses
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 from fastmcp import Context
@@ -28,6 +31,11 @@ stderr_handler = logging.StreamHandler(sys.stderr)
 stderr_handler.setLevel(logging.ERROR)
 stderr_handler.setFormatter(formatter)
 logger.addHandler(stderr_handler)
+
+
+async def _run(func, *args, **kwargs):
+    """Run a blocking (socket I/O) call off the event loop in a worker thread."""
+    return await anyio.to_thread.run_sync(functools.partial(func, *args, **kwargs))
 
 
 def _get_imap_client(username: str, password: str) -> IMAPClient:
@@ -53,8 +61,10 @@ def _close_imap_client(client: IMAPClient) -> None:
 def _find_trash_folder(client: IMAPClient) -> Optional[str]:
     """Locate the trash folder via SPECIAL-USE \\Trash, then common names."""
     try:
-        import imapclient as _imapclient
-        special = client.find_special_folder(_imapclient.TRASH)
+        # RFC 6154 SPECIAL-USE \Trash. Pass the literal flag: the constant lives
+        # at imapclient.imapclient.TRASH, not on the package, so the old
+        # imapclient.TRASH raised AttributeError and this path never ran.
+        special = client.find_special_folder(b"\\Trash")
         if special:
             return special
     except Exception:
@@ -74,12 +84,34 @@ def _expunge_message(client: IMAPClient, msg_id: int) -> None:
 
     A bare EXPUNGE also purges messages other clients (e.g. iPhone Mail)
     flagged \\Deleted but not yet expunged. Falls back to full expunge only
-    when the server lacks UIDPLUS.
+    when the server genuinely lacks UIDPLUS; any UID EXPUNGE failure on a
+    UIDPLUS server surfaces instead of silently widening to a full expunge.
+    """
+    if client.has_capability('UIDPLUS'):
+        client.uid_expunge([msg_id])
+    else:
+        client.expunge()
+
+
+def _last_copyuid(client: IMAPClient) -> Optional[int]:
+    """Destination UID from the server's COPYUID (UIDPLUS) response, or None.
+
+    The COPYUID response code (``COPYUID <uidvalidity> <src-set> <dest-set>``)
+    lands in imaplib's untagged_responses after a UID COPY; imapclient.copy()
+    does not surface it. Read it right after the copy, before the next command.
     """
     try:
-        client.expunge([msg_id])
+        resp = client._imap.untagged_responses.pop('COPYUID', None)
+        if not resp:
+            return None
+        raw = resp[-1]
+        if isinstance(raw, bytes):
+            raw = raw.decode('ascii', errors='ignore')
+        # last token is the dest UID set; for a single message it is one UID
+        dest = raw.split()[-1].split(',')[-1].split(':')[-1]
+        return int(dest)
     except Exception:
-        client.expunge()
+        return None
 
 
 def _get_smtp_client(username: str, password: str) -> smtplib.SMTP:
@@ -97,7 +129,12 @@ def _decode_mime_header(header_value: str) -> str:
     if not header_value:
         return ""
 
-    decoded_parts = decode_header(header_value)
+    # A malformed encoded-word (e.g. "=?utf-8?b?A!!!?=") makes decode_header
+    # raise HeaderParseError; fall back to the raw header rather than propagate.
+    try:
+        decoded_parts = decode_header(header_value)
+    except Exception:
+        return header_value
     result = []
 
     for content, charset in decoded_parts:
@@ -122,9 +159,9 @@ async def list_folders(context: Context) -> List[Dict[str, Any]]:
     try:
         username, password = require_auth(context)
 
-        client = _get_imap_client(username, password)
+        client = await _run(_get_imap_client, username, password)
 
-        folders = client.list_folders()
+        folders = await _run(client.list_folders)
 
         result = []
         for flags, delimiter, name in folders:
@@ -161,17 +198,23 @@ async def list_messages(
     Returns:
     """
     try:
+        # Clamp limit: limit<=0 -> [-0:] returns the WHOLE folder; a hard cap
+        # bounds the fetch regardless of caller input.
+        if limit is None or limit <= 0:
+            limit = 20
+        limit = min(limit, 200)
+
         username, password = require_auth(context)
 
-        client = _get_imap_client(username, password)
+        client = await _run(_get_imap_client, username, password)
 
-        client.select_folder(folder)
+        await _run(client.select_folder, folder)
 
         # Search for messages
         if unread_only:
-            messages = client.search(['UNSEEN'])
+            messages = await _run(client.search, ['UNSEEN'])
         else:
-            messages = client.search(['ALL'])
+            messages = await _run(client.search, ['ALL'])
 
 
         # Get most recent messages
@@ -182,7 +225,7 @@ async def list_messages(
             return []
 
         # Fetch full message body to extract body_text
-        response = client.fetch(message_ids, [b'FLAGS', b'BODY.PEEK[]'])
+        response = await _run(client.fetch, message_ids, [b'FLAGS', b'BODY.PEEK[]'])
 
         result = []
         for msg_id, data in response.items():
@@ -265,14 +308,14 @@ async def get_message(
     """
     try:
         username, password = require_auth(context)
-        client = _get_imap_client(username, password)
+        client = await _run(_get_imap_client, username, password)
 
-        client.select_folder(folder)
+        await _run(client.select_folder, folder)
 
         msg_id = int(message_id)
 
         # Use BODY.PEEK[] instead of RFC822 - more reliable with IMAPClient
-        response = client.fetch([msg_id], [b'FLAGS', b'BODY.PEEK[]'])
+        response = await _run(client.fetch, [msg_id], [b'FLAGS', b'BODY.PEEK[]'])
 
         if msg_id not in response:
             raise ValueError(f"Message {message_id} not found")
@@ -366,78 +409,87 @@ async def get_messages(
     """
     try:
         username, password = require_auth(context)
-        client = _get_imap_client(username, password)
+        client = await _run(_get_imap_client, username, password)
 
-        client.select_folder(folder)
+        await _run(client.select_folder, folder)
 
-        # Convert string IDs to integers
-        msg_ids = [int(mid) for mid in message_ids]
+        # Convert string IDs to integers, capped: this is the one fetch path
+        # without a limit, so an arbitrarily long message_ids list would pull
+        # unbounded full bodies into memory (the shape the limit clamp prevents
+        # elsewhere).
+        msg_ids = [int(mid) for mid in message_ids][:200]
 
         # Fetch all messages at once
-        response = client.fetch(msg_ids, [b'FLAGS', b'BODY.PEEK[]'])
+        response = await _run(client.fetch, msg_ids, [b'FLAGS', b'BODY.PEEK[]'])
 
         results = []
 
         for msg_id in msg_ids:
-            if msg_id not in response:
-                # Skip missing messages
+            # Guard each message: one poisoned message (or a RecursionError
+            # from message_from_bytes on deep MIME nesting) must not kill the
+            # whole batch.
+            try:
+                if msg_id not in response:
+                    # Skip missing messages
+                    continue
+
+                data = response[msg_id]
+
+                # Try multiple possible keys for the message body
+                raw_email = None
+                for key in [b'BODY[]', 'BODY[]', b'RFC822', 'RFC822', b'BODY.PEEK[]']:
+                    if key in data:
+                        raw_email = data[key]
+                        break
+
+                if raw_email is None:
+                    # Skip messages without body
+                    continue
+
+                msg = email.message_from_bytes(raw_email)
+
+                result = {
+                    "id": str(msg_id),
+                    "subject": _decode_mime_header(msg.get('Subject', '')),
+                    "from": _decode_mime_header(msg.get('From', '')),
+                    "to": _decode_mime_header(msg.get('To', '')),
+                    "cc": _decode_mime_header(msg.get('Cc', '')),
+                    "date": msg.get('Date', ''),
+                    "flags": [flag.decode() if isinstance(flag, bytes) else flag for flag in data.get(b'FLAGS', data.get('FLAGS', []))],
+                    "folder": folder
+                }
+
+                if include_body:
+                    # Extract body
+                    body_text = ""
+                    body_html = ""
+
+                    if msg.is_multipart():
+                        for part in msg.walk():
+                            content_type = part.get_content_type()
+                            if content_type == "text/plain":
+                                try:
+                                    body_text = part.get_payload(decode=True).decode('utf-8', errors='ignore')
+                                except Exception as _e:
+                                    pass
+                            elif content_type == "text/html" and full_html:
+                                try:
+                                    body_html = part.get_payload(decode=True).decode('utf-8', errors='ignore')
+                                except Exception as _e:
+                                    pass
+                    else:
+                        try:
+                            body_text = msg.get_payload(decode=True).decode('utf-8', errors='ignore')
+                        except Exception as _e:
+                            pass
+
+                    result["body_text"] = body_text
+                    if full_html:
+                        result["body_html"] = body_html
+
+                results.append(result)
+            except Exception as _e:
                 continue
-
-            data = response[msg_id]
-
-            # Try multiple possible keys for the message body
-            raw_email = None
-            for key in [b'BODY[]', 'BODY[]', b'RFC822', 'RFC822', b'BODY.PEEK[]']:
-                if key in data:
-                    raw_email = data[key]
-                    break
-
-            if raw_email is None:
-                # Skip messages without body
-                continue
-
-            msg = email.message_from_bytes(raw_email)
-
-            result = {
-                "id": str(msg_id),
-                "subject": _decode_mime_header(msg.get('Subject', '')),
-                "from": _decode_mime_header(msg.get('From', '')),
-                "to": _decode_mime_header(msg.get('To', '')),
-                "cc": _decode_mime_header(msg.get('Cc', '')),
-                "date": msg.get('Date', ''),
-                "flags": [flag.decode() if isinstance(flag, bytes) else flag for flag in data.get(b'FLAGS', data.get('FLAGS', []))],
-                "folder": folder
-            }
-
-            if include_body:
-                # Extract body
-                body_text = ""
-                body_html = ""
-
-                if msg.is_multipart():
-                    for part in msg.walk():
-                        content_type = part.get_content_type()
-                        if content_type == "text/plain":
-                            try:
-                                body_text = part.get_payload(decode=True).decode('utf-8', errors='ignore')
-                            except Exception as _e:
-                                pass
-                        elif content_type == "text/html" and full_html:
-                            try:
-                                body_html = part.get_payload(decode=True).decode('utf-8', errors='ignore')
-                            except Exception as _e:
-                                pass
-                else:
-                    try:
-                        body_text = msg.get_payload(decode=True).decode('utf-8', errors='ignore')
-                    except Exception as _e:
-                        pass
-
-                result["body_text"] = body_text
-                if full_html:
-                    result["body_html"] = body_html
-
-            results.append(result)
 
         return results
 
@@ -466,18 +518,27 @@ async def search_messages(
     Returns:
         List of matching messages
     """
+    # Clamp limit: limit<=0 -> [-0:] returns the WHOLE folder; a hard cap
+    # bounds the fetch regardless of caller input.
+    if limit is None or limit <= 0:
+        limit = 20
+    limit = min(limit, 200)
+
     username, password = require_auth(context)
-    client = _get_imap_client(username, password)
+    client = await _run(_get_imap_client, username, password)
 
     try:
-        client.select_folder(folder)
+        await _run(client.select_folder, folder)
 
         # Try server-side search with UTF-8 charset (RFC 2978)
         # This works with modern IMAP servers including iCloud
         try:
-            # Search by subject or from using UTF-8 charset
-            messages = client.search(
-                ['OR', ['SUBJECT', query], ['FROM', query]],
+            # FLAT criteria: nested ['OR',['SUBJECT',q],['FROM',q]] makes
+            # imapclient drop the CHARSET, so every non-ASCII query failed
+            # into the local-filtering fallback.
+            messages = await _run(
+                client.search,
+                ['OR', 'SUBJECT', query, 'FROM', query],
                 charset='UTF-8'
             )
 
@@ -488,7 +549,7 @@ async def search_messages(
                 return []
 
             # Fetch full message body to extract body_text
-            response = client.fetch(message_ids, [b'FLAGS', b'BODY.PEEK[]'])
+            response = await _run(client.fetch, message_ids, [b'FLAGS', b'BODY.PEEK[]'])
 
             result = []
             for msg_id, data in response.items():
@@ -537,16 +598,18 @@ async def search_messages(
 
             return result
 
-        except Exception as charset_error:
-            # Fallback: If CHARSET UTF-8 is not supported by server,
-            # fall back to local filtering (less efficient but always works)
+        except imaplib.IMAP4.error as charset_error:
+            # Only an IMAP search/charset failure (imapclient errors subclass
+            # imaplib.IMAP4.error) triggers the local-filtering fallback; a
+            # message-parse bug or a network error must NOT be masked as an
+            # unsupported charset and silently rescan the whole folder.
             logger.error(f"Server-side UTF-8 search failed: {charset_error}. Falling back to local filtering.")
 
-            # Fetch more messages to search through locally
-            fetch_limit = max(limit * 10, 200)
+            # Fetch more messages to search through locally, hard-capped.
+            fetch_limit = min(max(limit * 10, 200), 500)
 
             # Get all message IDs
-            all_msg_ids = client.search(['ALL'])
+            all_msg_ids = await _run(client.search, ['ALL'])
             message_ids = list(all_msg_ids)[-fetch_limit:] if len(all_msg_ids) > fetch_limit else list(all_msg_ids)
             message_ids.reverse()
 
@@ -554,7 +617,7 @@ async def search_messages(
                 return []
 
             # Fetch full messages with body
-            response = client.fetch(message_ids, [b'FLAGS', b'BODY.PEEK[]'])
+            response = await _run(client.fetch, message_ids, [b'FLAGS', b'BODY.PEEK[]'])
 
             all_messages = []
             for msg_id, data in response.items():
@@ -658,20 +721,61 @@ async def send_message(
     if html:
         msg.attach(MIMEText(body, 'html'))
 
-    # Send via SMTP
-    with _get_smtp_client(username, password) as client:
-        recipients = [to]
-        if cc:
-            recipients.extend([addr.strip() for addr in cc.split(',')])
-        if bcc:
-            recipients.extend([addr.strip() for addr in bcc.split(',')])
+    recipients = [to]
+    if cc:
+        recipients.extend([addr.strip() for addr in cc.split(',')])
+    if bcc:
+        recipients.extend([addr.strip() for addr in bcc.split(',')])
 
-        client.send_message(msg, from_addr=username, to_addrs=recipients)
+    # Reject any recipient that does not parse to exactly one address. A form
+    # like "attacker@evil.com," parses to zero addresses yet smtplib would
+    # still deliver it, sneaking past the allowlist; a multi-address string
+    # would split unpredictably. Fail loudly instead.
+    for r in recipients:
+        if len([a for _name, a in getaddresses([r]) if a]) != 1:
+            raise ValueError(f"Invalid recipient address: {r!r}")
+
+    # Normalize to bare addresses so the allowlist check and the SMTP envelope
+    # operate on the SAME set: raw recipient strings and getaddresses-parsed
+    # addresses diverge, so handing SMTP the raw strings would deliver to
+    # addresses the allowlist never approved.
+    addrs = [addr for _name, addr in getaddresses(recipients) if addr]
+
+    # Recipient allowlist: an empty list means allow all (back-compat). When
+    # set, every to/cc/bcc address must be present or the send is refused.
+    allowlist = config.EMAIL_SEND_ALLOWLIST
+    if allowlist:
+        allowed = {a.lower() for a in allowlist}
+        disallowed = [a for a in addrs if a.lower() not in allowed]
+        if disallowed:
+            raise ValueError(
+                "Recipient(s) not in EMAIL_SEND_ALLOWLIST: " + ", ".join(disallowed)
+            )
+
+    # Send via SMTP (off the event loop; connect+login+send are blocking)
+    client = await _run(_get_smtp_client, username, password)
+    try:
+        await _run(client.send_message, msg, from_addr=username, to_addrs=addrs)
+    finally:
+        # Synchronous cleanup, NOT await _run(...): if the request is cancelled
+        # mid-send, an awaited call in finally hits a checkpoint under an
+        # already-cancelled scope and raises CancelledError (a BaseException,
+        # not caught by except Exception) before quit/close run, leaking the
+        # socket. quit() only reaches close() if QUIT succeeds; the second
+        # guard releases the socket even when QUIT throws.
+        try:
+            client.quit()
+        except Exception as _e:
+            pass
+        try:
+            client.close()
+        except Exception as _e:
+            pass
 
     # Save copy to Sent folder via IMAP
     imap_client = None
     try:
-        imap_client = _get_imap_client(username, password)
+        imap_client = await _run(_get_imap_client, username, password)
 
         # Add Date header if not present
         if 'Date' not in msg:
@@ -685,12 +789,12 @@ async def send_message(
 
         # Try to append to Sent folder
         try:
-            imap_client.append(config.SENT_FOLDER, msg_bytes, flags=['\\Seen'])
+            await _run(imap_client.append, config.SENT_FOLDER, msg_bytes, flags=['\\Seen'])
         except Exception as e:
             # If Sent Messages folder doesn't exist, try common alternatives
             for folder_name in ['Sent', 'Sent Items', config.SENT_FOLDER]:
                 try:
-                    imap_client.append(folder_name, msg_bytes, flags=['\\Seen'])
+                    await _run(imap_client.append, folder_name, msg_bytes, flags=['\\Seen'])
                     break
                 except Exception:
                     continue
@@ -731,23 +835,34 @@ async def move_message(
     """
     username, password = require_auth(context)
 
-    client = _get_imap_client(username, password)
-    
+    client = await _run(_get_imap_client, username, password)
+
     try:
-        client.select_folder(from_folder)
+        await _run(client.select_folder, from_folder)
         msg_id = int(message_id)
 
+        # UIDs are folder-scoped: a stale/cross-folder id would otherwise copy
+        # then delete the WRONG message (or nothing) and still report success.
+        check = await _run(client.fetch, [msg_id], [b'FLAGS'])
+        if msg_id not in check:
+            raise ValueError(f"Message {message_id} not found in folder {from_folder}")
+
         # Copy to destination
-        client.copy([msg_id], to_folder)
+        await _run(client.copy, [msg_id], to_folder)
+        new_uid = _last_copyuid(client)
 
         # Delete from source
-        client.delete_messages([msg_id])
-        _expunge_message(client, msg_id)
+        await _run(client.delete_messages, [msg_id])
+        await _run(_expunge_message, client, msg_id)
 
-        return {
+        result = {
             "status": "success",
             "message": f"Message {message_id} moved from {from_folder} to {to_folder}"
         }
+        if new_uid is not None:
+            result["new_id"] = str(new_uid)
+            result["message"] += f" (new id {new_uid})"
+        return result
     finally:
         try:
             _close_imap_client(client)
@@ -773,31 +888,37 @@ async def delete_message(
     """
     username, password = require_auth(context)
 
-    client = _get_imap_client(username, password)
-    
+    client = await _run(_get_imap_client, username, password)
+
     try:
-        client.select_folder(folder)
+        await _run(client.select_folder, folder)
         msg_id = int(message_id)
+
+        # UIDs are folder-scoped: without this check a stale/cross-folder id
+        # would delete the wrong message (or nothing) and still report success.
+        check = await _run(client.fetch, [msg_id], [b'FLAGS'])
+        if msg_id not in check:
+            raise ValueError(f"Message {message_id} not found in folder {folder}")
 
         if permanent:
             # Permanent deletion
-            client.delete_messages([msg_id])
-            _expunge_message(client, msg_id)
+            await _run(client.delete_messages, [msg_id])
+            await _run(_expunge_message, client, msg_id)
             message = f"Message {message_id} permanently deleted"
         else:
             # Move to trash. NEVER fall back to permanent deletion: the old
             # fallback turned ANY copy failure (folder named "Deleted
             # Messages" on iCloud, network hiccup, quota) into a silent
             # permanent delete reported as "moved to Trash".
-            trash = _find_trash_folder(client)
+            trash = await _run(_find_trash_folder, client)
             if trash is None:
                 raise ValueError(
                     "No trash folder found on the server; "
                     "pass permanent=True to delete permanently"
                 )
-            client.copy([msg_id], trash)
-            client.delete_messages([msg_id])
-            _expunge_message(client, msg_id)
+            await _run(client.copy, [msg_id], trash)
+            await _run(client.delete_messages, [msg_id])
+            await _run(_expunge_message, client, msg_id)
             message = f"Message {message_id} moved to {trash}"
 
         return {
@@ -827,12 +948,12 @@ async def mark_as_read(
     """
     username, password = require_auth(context)
 
-    client = _get_imap_client(username, password)
-    
+    client = await _run(_get_imap_client, username, password)
+
     try:
-        client.select_folder(folder)
+        await _run(client.select_folder, folder)
         msg_id = int(message_id)
-        client.add_flags([msg_id], ['\\Seen'])
+        await _run(client.add_flags, [msg_id], ['\\Seen'])
 
         return {
             "status": "success",
@@ -861,12 +982,12 @@ async def mark_as_unread(
     """
     username, password = require_auth(context)
 
-    client = _get_imap_client(username, password)
-    
+    client = await _run(_get_imap_client, username, password)
+
     try:
-        client.select_folder(folder)
+        await _run(client.select_folder, folder)
         msg_id = int(message_id)
-        client.remove_flags([msg_id], ['\\Seen'])
+        await _run(client.remove_flags, [msg_id], ['\\Seen'])
 
         return {
             "status": "success",

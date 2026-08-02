@@ -26,31 +26,50 @@ def require_trusted_url(url: str, base: str, kind: str) -> None:
     if not parsed.scheme and not parsed.netloc:
         return
     base_parsed = urlparse(base)
-    host = parsed.hostname or ""
-    base_host = base_parsed.hostname or ""
-    base_domain = base_host.split(".", 1)[-1] if "." in base_host else base_host
-    same_domain = host == base_host or host == base_domain or host.endswith("." + base_domain)
+    # urlparse and requests/urllib3 disagree on authorities containing a
+    # backslash or userinfo: urlparse reports the trailing host while the HTTP
+    # stack connects to the leading host, so a payload like
+    # "https://evil.com\@contacts.icloud.com/x" would pass the host check below
+    # yet send the Basic-Auth credential to evil.com. Reject those outright.
+    if "\\" in parsed.netloc or "@" in parsed.netloc:
+        raise ValueError(
+            f"{kind} has an untrusted authority; refusing to send credentials to "
+            f"{parsed.netloc}"
+        )
+    # Strip a trailing root dot so the FQDN form (contacts.icloud.com.) of the
+    # configured host is not rejected as foreign.
+    host = (parsed.hostname or "").rstrip(".")
+    base_host = (base_parsed.hostname or "").rstrip(".")
+    # Registrable parent: for a 3+ label host (e.g. contacts.icloud.com) this is
+    # the last two labels (icloud.com), which admits provider partition hosts
+    # like p72-caldav.icloud.com. For a 2-label base it stays the base itself so
+    # the check never widens to a public suffix (.com).
+    labels = base_host.split(".")
+    parent = ".".join(labels[-2:]) if len(labels) >= 3 else base_host
+    same_domain = host == base_host or host.endswith("." + parent)
     if parsed.scheme != base_parsed.scheme or not same_domain:
         raise ValueError(
             f"{kind} must be a relative path or a {base_parsed.scheme} URL under "
-            f"{base_domain}; refusing to send credentials to {parsed.scheme}://{host}"
+            f"{base_host}; refusing to send credentials to {parsed.netloc}"
         )
 
 
 def get_credentials(context: Context) -> Tuple[str, str]:
     """Extract iCloud credentials from HTTP headers."""
 
-    # Get HTTP headers using FastMCP's dependency function
+    # Get HTTP headers using FastMCP's dependency function (keys are lowercased)
     headers = get_http_headers()
 
-    # Extract credentials from headers
-    email: Optional[str] = headers.get("x-apple-email") or headers.get("X-Apple-Email")
-    password: Optional[str] = headers.get("x-apple-app-specific-password") or headers.get("X-Apple-App-Specific-Password")
-
-    # Fallback to environment variables
-    if not email:
+    email: Optional[str]
+    password: Optional[str]
+    # If either credential header is present, both credentials come from headers
+    # only. Never pair a caller-supplied header with the operator's env secret:
+    # that would let an attacker's email header borrow the env password.
+    if "x-apple-email" in headers or "x-apple-app-specific-password" in headers:
+        email = headers.get("x-apple-email")
+        password = headers.get("x-apple-app-specific-password")
+    else:
         email = config.FALLBACK_EMAIL
-    if not password:
         password = config.FALLBACK_PASSWORD
 
     # Validate credentials
